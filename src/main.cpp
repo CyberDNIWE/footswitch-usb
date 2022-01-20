@@ -1,125 +1,212 @@
-#include <Arduino.h>
-#include <Keyboard.h>
+#define WOKWI_NOHID_EMULATOR 1
 
-// pin modes
-enum pin_modes
+#ifdef WOKWI_NOHID_EMULATOR
+#include "Keyboard.h"
+#else
+#include <Keyboard.h>
+#endif
+
+
+class Pin
 {
-  NOT_USED,
-  SEND_CODE_BUTTON_CLOSED,
-  SEND_CODE_BUTTON_RELEASED,
-  SEND_PRESS_RELEASE,
+public:
+	enum enState
+	{
+		OPEN = 0,
+		CLOSED = 1
+	};
+
+	Pin(int num, bool pinLevel = HIGH, int8_t setupState = INPUT_PULLUP) noexcept : m_num(num), m_setupState(setupState), m_pinLevel(pinLevel)
+	{
+		setUp();
+	}
+
+	bool isTriggered(unsigned int debounceDelay = 0) noexcept
+	{
+		return debounceDelay ? isTriggeredWithDebounce(debounceDelay) : isTriggeredNoDebounce();
+	}
+
+	enState getState() const noexcept
+	{
+		return static_cast<enState>(!static_cast<bool>(m_pinLevel));
+	}
+
+protected:
+	bool setUp() noexcept
+	{
+		pinMode(m_num, m_setupState);
+		return true;
+	}
+
+	bool checkTriggered(bool& pinval) const noexcept
+	{
+		pinval = digitalRead(m_num);
+		return !(pinval == m_pinLevel);
+	}
+
+	inline void setNewPinLevel(bool level) noexcept
+	{
+		m_pinLevel = level;
+	}
+
+	bool isTriggeredNoDebounce()
+	{
+		bool hasChanged = false;
+		bool pinval = false;
+
+		if(hasChanged = checkTriggered(pinval))
+		{
+			setNewPinLevel(pinval);
+		}
+
+		return hasChanged;
+	}
+
+	bool isTriggeredWithDebounce(unsigned int debounceDelay)
+	{
+
+		bool hasChanged = false;
+		bool pinval = false;
+
+		if(checkTriggered(pinval))
+		{
+			delay(debounceDelay);
+			if(hasChanged = checkTriggered(pinval))
+			{
+				setNewPinLevel(pinval);
+			}
+		}
+		return hasChanged;
+	}
+
+	// void tell()
+	// {
+	//   Serial.print("Pin num: "); Serial.print(m_num); Serial.print("; \n PinLevel: "); Serial.print(m_pinLevel); Serial.print("\n\n");
+	//   delay(1000);
+	// }
+
+
+	int m_num;
+	int8_t m_setupState;
+	bool m_pinLevel;
 };
 
-//
-// definition of all pins that are connected to buttons
-#define FIRSTPIN      2 // pins 0-1 are not used
-#define BUTTON_UP     2
-#define BUTTON_DOWN   3
-#define BUTTON_SPACE  4
-#define BUTTON_BACK   5
-#define LASTPIN_PLUS1 6 // not used
+class KeyboardObserver
+{
+public:
+	constexpr KeyboardObserver(Keyboard_* kb = nullptr) noexcept : m_kb(kb)
+	{}
 
+	template<typename F>
+	void notify(const F& func) const noexcept
+	{
+		if(m_kb)
+		{
+			func(*m_kb);
+		}
+	}
+
+protected:
+	Keyboard_* m_kb;
+};
+
+template<typename OBS = void>
+class Button
+{
+public:
+	constexpr Button(Pin pin, uint8_t id, const OBS* observer = nullptr, unsigned int debounceMs = 0) noexcept :
+		m_pin(pin), m_id(id), m_debounceMs(debounceMs), m_observer(observer)
+	{};
+
+	void poll() noexcept
+	{
+		if(m_pin.isTriggered(m_debounceMs))
+		{
+			notifyStateChange();
+		}
+	}
+
+protected:
+	void notifyStateChange()
+	{
+		if(m_observer)
+		{
+			auto state = m_pin.getState();
+			switch(state)
+			{
+			case Pin::enState::OPEN:
+			{
+				const auto id = m_id;
+				m_observer->notify(
+					[id](Keyboard_& kb)
+				{
+					kb.release(id);
+				});
+				break;
+			}
+
+			case Pin::enState::CLOSED:
+			{
+				const auto id = m_id;
+				m_observer->notify(
+					[id](Keyboard_& kb)
+				{
+					kb.press(id);
+				});
+				break;
+			}
+
+			default:
+				break;
+			}
+		}
+	}
+
+	Pin m_pin;
+	uint8_t m_id;
+	unsigned int m_debounceMs;
+	const OBS* m_observer = nullptr;
+
+};
+
+template<typename OBS = void>
+constexpr Button<OBS> make_button(Pin p, uint8_t buttonID, const OBS* observer = nullptr, unsigned int debounceMs = 0) noexcept
+{
+	return Button<OBS>(p, buttonID, observer, debounceMs);
+}
+
+// definition of all pins that are connected to buttons
+#define PIN_FOR_BUTTON_UP     2
+#define PIN_FOR_BUTTON_DOWN   3
+#define PIN_FOR_BUTTON_SPACE  4
+#define PIN_FOR_BUTTON_BACK   5
+
+// definition for special keys
+#define KEY_SPACEBAR_CUSTOM ' '
+
+// Debounce timing
 #define DEBOUNCE 50
 
-// setup all button keycodes and pin modes
-bool            button_pin_state[LASTPIN_PLUS1];
-uint8_t         button_keycode[LASTPIN_PLUS1] =
+// Create keyboard observer and make it forward notifications to Keyboard
+const KeyboardObserver kb_observer = KeyboardObserver(&Keyboard);
+// Create buttons that notify kb_observer of their state changes
+Button<KeyboardObserver> buttons[] =
 {
-  0,            // pin 0 not used
-  0,            // pin 1 not used
-  KEY_UP_ARROW,
-  KEY_DOWN_ARROW,
-  ' ',
-  KEY_LEFT_ARROW,
+  make_button(Pin(PIN_FOR_BUTTON_UP),    KEY_UP_ARROW,         &kb_observer, DEBOUNCE),
+  make_button(Pin(PIN_FOR_BUTTON_DOWN),  KEY_DOWN_ARROW,       &kb_observer, DEBOUNCE),
+  make_button(Pin(PIN_FOR_BUTTON_SPACE), KEY_SPACEBAR_CUSTOM,  &kb_observer, DEBOUNCE)
 };
-
-enum pin_modes  button_pin_mode[LASTPIN_PLUS1] =
-{
-  NOT_USED,     // pin 0 not used
-  NOT_USED,     // pin 1 not used
-  SEND_PRESS_RELEASE,
-  SEND_PRESS_RELEASE,
-  SEND_PRESS_RELEASE,
-  SEND_CODE_BUTTON_CLOSED,
-};
-
-int i,j;
 
 void setup()
 {
-  // all button pins are active low. turn on internal pullup
-  for (i=FIRSTPIN ; i<LASTPIN_PLUS1 ; i++)
-  {
-    pinMode(i, INPUT_PULLUP);
-    button_pin_state[i] = HIGH;
-  }
+	// Not really needed for now
 }
 
-// Check button GPIO pin status and return true if it has changed
-bool button_change(uint8_t button)
-{
-  bool ret_val = 0;
-  if (digitalRead(button) == !button_pin_state[button])
-  {
-    delay(DEBOUNCE);
-    if (digitalRead(button) == !button_pin_state[button])
-    {
-      button_pin_state[button] = digitalRead(button);
-      ret_val = 1;
-    }
-  }
-  return ret_val;
-}
-
-// loop through all buttons and send keycodes/events depending on the
-// selected mode. A pressed button (closed switch) == LOW (FALSE) since
-// the inputs are active low.
 void loop()
 {
-  for (j=FIRSTPIN ; j<LASTPIN_PLUS1 ; j++)
-  {
-    switch (button_pin_mode[j])
-    {
-      // send keycode when button is pressed (switch closed)
-      case SEND_CODE_BUTTON_CLOSED:
-        if (button_change(j))
-        {
-          if (!button_pin_state[j])
-          {
-            Keyboard.write(button_keycode[j]);
-          }
-        }
-        break;
-
-      // send keycode when button is released (switch opened)
-      case SEND_CODE_BUTTON_RELEASED:
-        if (button_change(j))
-        {
-          if (button_pin_state[j])
-          {
-            Keyboard.write(button_keycode[j]);
-          }
-        }
-        break;
-
-      // send pressed and released events when switched is closed or opened
-      case SEND_PRESS_RELEASE:
-        if (button_change(j))
-        {
-          if (button_pin_state[j])
-          {
-            Keyboard.release(button_keycode[j]);
-          }
-          else
-          {
-            Keyboard.press(button_keycode[j]);
-          }
-        }
-        break;
-
-      case NOT_USED:
-      default:
-        break;
-    }
-  }
+	// Poll every button
+	for(const auto& button : buttons)
+	{
+		button.poll();
+	}
 }
